@@ -6,6 +6,9 @@ export interface EnvironmentVariables {
 	DATABASE_URL: string;
 	CORS_ORIGINS: string;
 	LOG_LEVEL: "error" | "warn" | "log" | "debug" | "verbose";
+	AUTH_JWT_SECRET: string;
+	AUTH_JWT_ISSUER?: string;
+	AUTH_JWT_AUDIENCE?: string;
 }
 
 const isLocal = Joi.valid("development", "test");
@@ -26,6 +29,13 @@ export const environmentSchema = Joi.object<EnvironmentVariables>({
 	LOG_LEVEL: Joi.string()
 		.valid("error", "warn", "log", "debug", "verbose")
 		.default("log"),
+	AUTH_JWT_SECRET: Joi.when("NODE_ENV", {
+		is: isLocal,
+		then: Joi.string().min(16).default("change-me-in-development-only"),
+		otherwise: Joi.string().min(32).required(),
+	}),
+	AUTH_JWT_ISSUER: Joi.string().optional(),
+	AUTH_JWT_AUDIENCE: Joi.string().optional(),
 }).unknown();
 
 export function validateEnvironment(

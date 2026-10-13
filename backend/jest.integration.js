@@ -4,7 +4,15 @@ module.exports = {
   testEnvironment: "node",
   testRegex: "test/integration/.*\\.int-spec\\.ts$",
   transform: {
-    "^.+\\.(t|j)s$": "ts-jest",
+    "^.+\\.(t|j)s$": [
+      "ts-jest",
+      {
+        tsconfig: {
+          emitDecoratorMetadata: true,
+          experimentalDecorators: true,
+        },
+      },
+    ],
   },
   testTimeout: 60_000,
   maxWorkers: 1,

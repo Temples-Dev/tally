@@ -1,10 +1,13 @@
 import { Controller, Get } from "@nestjs/common";
 import { ApiOperation, ApiResponse, ApiTags } from "@nestjs/swagger";
 
-import type { HealthService, HealthStatus } from "./health.service";
+import { Public } from "../identity/public.decorator";
+// biome-ignore lint/style/useImportType: injected tokens must be value imports for decorator metadata.
+import { HealthService, HealthStatus } from "./health.service";
 
 @ApiTags("health")
 @Controller("health")
+@Public()
 export class HealthController {
 	constructor(private readonly healthService: HealthService) {}
 

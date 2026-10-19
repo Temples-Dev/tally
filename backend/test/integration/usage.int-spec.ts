@@ -48,6 +48,8 @@ describe("Usage metering ingestion (integration)", () => {
 	let customerB = "";
 	let subscriptionA = "";
 	let aggregationMetricId = "";
+	let aggregationFrom: Date;
+	let aggregationTo: Date;
 	let acceptedEventId = "";
 	let acceptedOccurredAt = "";
 
@@ -408,6 +410,8 @@ describe("Usage metering ingestion (integration)", () => {
 		const base = now - 5 * 60_000;
 		const from = utcStart(base);
 		const to = new Date(utcStart(now).getTime() + 86_400_000);
+		aggregationFrom = from;
+		aggregationTo = to;
 
 		const first = await api(alice, tenantA)
 			.post("/usage/events")
@@ -539,6 +543,49 @@ describe("Usage metering ingestion (integration)", () => {
 		expect((await waitForSummary(lastMetric, from, to, "5", 2)).total).toBe(
 			"5",
 		);
+	});
+
+	it("reports processing status and reconciles aggregates", async () => {
+		const deadline = Date.now() + 20_000;
+		let status = 0;
+		let body: {
+			backlogClear?: boolean;
+			events?: { count?: number; latestReceivedAt?: string | null };
+			aggregates?: { lastCalculatedAt?: string | null };
+			backlog?: { lastCompletedAt?: string | null };
+		} = {};
+		while (Date.now() < deadline) {
+			const response = await api(alice, tenantA).get(
+				`/usage/processing-status?metricId=${aggregationMetricId}`,
+			);
+			status = response.status;
+			body = response.body;
+			if (status === 200 && body.backlogClear === true) {
+				break;
+			}
+			await delay(50);
+		}
+		expect(status).toBe(200);
+		expect(body.backlogClear).toBe(true);
+		expect(body.events?.count).toBe(3);
+		expect(body.events?.latestReceivedAt).toBeTruthy();
+		expect(body.aggregates?.lastCalculatedAt).toBeTruthy();
+		expect(body.backlog?.lastCompletedAt).toBeTruthy();
+
+		const reconciliation = await api(alice, tenantA).get(
+			`/usage/reconciliation?metricId=${aggregationMetricId}&from=${encodeURIComponent(
+				aggregationFrom.toISOString(),
+			)}&to=${encodeURIComponent(aggregationTo.toISOString())}`,
+		);
+		expect(reconciliation.status).toBe(200);
+		expect(reconciliation.body).toMatchObject({
+			eventTotal: "4",
+			aggregateTotal: "4",
+			eventCount: 3,
+			aggregateEventCount: 3,
+			matches: true,
+			difference: "0",
+		});
 	});
 
 	it("enforces roles and tenant isolation", async () => {

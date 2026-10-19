@@ -30,6 +30,7 @@ import {
 	IngestUsageBatchDto,
 	IngestUsageEventDto,
 	ListUsageEventsQueryDto,
+	UsageSummaryQueryDto,
 } from "./usage.dto";
 // biome-ignore lint/style/useImportType: injected tokens must be value imports for decorator metadata.
 import { UsageService } from "./usage.service";
@@ -92,6 +93,16 @@ export class UsageController {
 		@CurrentTenantId() tenantId?: string,
 	) {
 		return this.usage.listEvents(requireTenant(tenantId), query);
+	}
+
+	@Get("usage/summary")
+	@ApiOperation({ summary: "Retrieve aggregated usage for a period" })
+	@ApiOkResponse({ description: "Aggregated usage and freshness" })
+	summary(
+		@Query() query: UsageSummaryQueryDto,
+		@CurrentTenantId() tenantId?: string,
+	) {
+		return this.usage.summary(requireTenant(tenantId), query);
 	}
 
 	@Get("usage/events/:id")

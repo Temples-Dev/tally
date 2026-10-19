@@ -60,6 +60,25 @@ export class IngestUsageBatchDto {
 	events: unknown[];
 }
 
+export class UsageSummaryQueryDto {
+	@IsUUID()
+	metricId: string;
+
+	@IsOptional()
+	@IsUUID()
+	customerAccountId?: string;
+
+	@IsOptional()
+	@IsUUID()
+	subscriptionId?: string;
+
+	@IsDateString()
+	from: string;
+
+	@IsDateString()
+	to: string;
+}
+
 export class ListUsageEventsQueryDto {
 	@IsOptional()
 	@IsUUID()

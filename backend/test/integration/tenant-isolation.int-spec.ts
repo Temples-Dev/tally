@@ -9,6 +9,8 @@ import {
 import request from "supertest";
 import { DataSource } from "typeorm";
 
+import { configureApp } from "../../src/app-setup";
+
 jest.setTimeout(60_000);
 
 const JWT_SECRET = "integration-secret-with-enough-length";
@@ -46,6 +48,7 @@ describe("Tenant isolation (integration)", () => {
 		}).compile();
 
 		app = moduleRef.createNestApplication({ logger: false });
+		configureApp(app);
 		await app.init();
 
 		dataSource = moduleRef.get(DataSource);
@@ -59,7 +62,7 @@ describe("Tenant isolation (integration)", () => {
 
 	it("rejects tenant creation without a token", async () => {
 		const response = await request(app.getHttpServer())
-			.post("/tenants")
+			.post("/v1/tenants")
 			.send({ name: "Nope" });
 
 		expect(response.status).toBe(401);
@@ -69,7 +72,7 @@ describe("Tenant isolation (integration)", () => {
 
 	it("lets the owner in and keeps strangers out", async () => {
 		const created = await request(app.getHttpServer())
-			.post("/tenants")
+			.post("/v1/tenants")
 			.set("Authorization", `Bearer ${alice}`)
 			.send({ name: "Acme Corp" });
 
@@ -78,14 +81,14 @@ describe("Tenant isolation (integration)", () => {
 		const tenantId = created.body.id as string;
 
 		const ownerRead = await request(app.getHttpServer())
-			.get(`/tenants/${tenantId}`)
+			.get(`/v1/tenants/${tenantId}`)
 			.set("Authorization", `Bearer ${alice}`)
 			.set("x-tenant-id", tenantId);
 		expect(ownerRead.status).toBe(200);
 		expect(ownerRead.body.name).toBe("Acme Corp");
 
 		const strangerRead = await request(app.getHttpServer())
-			.get(`/tenants/${tenantId}`)
+			.get(`/v1/tenants/${tenantId}`)
 			.set("Authorization", `Bearer ${bob}`)
 			.set("x-tenant-id", tenantId);
 		expect(strangerRead.status).toBe(404);
@@ -109,13 +112,13 @@ describe("Tenant isolation (integration)", () => {
 
 	it("rejects duplicate slugs and suspended tenants", async () => {
 		const first = await request(app.getHttpServer())
-			.post("/tenants")
+			.post("/v1/tenants")
 			.set("Authorization", `Bearer ${alice}`)
 			.send({ name: "Dupe Corp" });
 		expect(first.status).toBe(201);
 
 		const duplicate = await request(app.getHttpServer())
-			.post("/tenants")
+			.post("/v1/tenants")
 			.set("Authorization", `Bearer ${alice}`)
 			.send({ name: "Dupe Corp" });
 		expect(duplicate.status).toBe(409);
@@ -128,7 +131,7 @@ describe("Tenant isolation (integration)", () => {
 		);
 
 		const suspendedRead = await request(app.getHttpServer())
-			.get(`/tenants/${tenantId}`)
+			.get(`/v1/tenants/${tenantId}`)
 			.set("Authorization", `Bearer ${alice}`)
 			.set("x-tenant-id", tenantId);
 		expect(suspendedRead.status).toBe(403);

@@ -6,6 +6,8 @@ import {
 } from "@testcontainers/postgresql";
 import request from "supertest";
 
+import { configureApp } from "../../src/app-setup";
+
 jest.setTimeout(60_000);
 
 describe("Health (integration)", () => {
@@ -26,6 +28,7 @@ describe("Health (integration)", () => {
 		}).compile();
 
 		app = moduleRef.createNestApplication({ logger: false });
+		configureApp(app);
 		await app.init();
 	});
 
@@ -35,19 +38,19 @@ describe("Health (integration)", () => {
 	});
 
 	it("GET /health/live returns alive", async () => {
-		const response = await request(app.getHttpServer()).get("/health/live");
+		const response = await request(app.getHttpServer()).get("/v1/health/live");
 		expect(response.status).toBe(200);
 		expect(response.body).toEqual({ status: "alive" });
 	});
 
 	it("GET /health/ready returns ready", async () => {
-		const response = await request(app.getHttpServer()).get("/health/ready");
+		const response = await request(app.getHttpServer()).get("/v1/health/ready");
 		expect(response.status).toBe(200);
 		expect(response.body).toEqual({ status: "ready" });
 	});
 
 	it("GET /health reports database healthy", async () => {
-		const response = await request(app.getHttpServer()).get("/health");
+		const response = await request(app.getHttpServer()).get("/v1/health");
 		expect(response.status).toBe(200);
 		expect(response.body.status).toBe("ok");
 		expect(response.body.services).toEqual([

@@ -1,5 +1,3 @@
-import { join } from "node:path";
-
 import {
 	type MiddlewareConsumer,
 	Module,
@@ -8,16 +6,17 @@ import {
 import { ConfigModule, ConfigService } from "@nestjs/config";
 import { APP_FILTER, APP_GUARD } from "@nestjs/core";
 import { TypeOrmModule } from "@nestjs/typeorm";
-import { SnakeNamingStrategy } from "./database/snake-naming.strategy";
 
 import { CatalogModule } from "./catalog/catalog.module";
 import { CorrelationIdMiddleware } from "./common/correlation-id.middleware";
 import { ProblemDetailsFilter } from "./common/problem-details.filter";
 import { validateEnvironment } from "./config/environment.validation";
+import { typeOrmOptions } from "./database/typeorm-options";
 import { HealthModule } from "./health/health.module";
 import { IdentityModule } from "./identity/identity.module";
 import { JwtAuthGuard } from "./identity/jwt-auth.guard";
 import { SubscriptionsModule } from "./subscriptions/subscriptions.module";
+import { UsageModule } from "./usage/usage.module";
 
 @Module({
 	imports: [
@@ -27,20 +26,14 @@ import { SubscriptionsModule } from "./subscriptions/subscriptions.module";
 		}),
 		TypeOrmModule.forRootAsync({
 			imports: [ConfigModule],
-			useFactory: (configService: ConfigService) => ({
-				type: "postgres" as const,
-				url: configService.get<string>("DATABASE_URL"),
-				autoLoadEntities: true,
-				synchronize: false,
-				migrations: [join(__dirname, "database", "migrations", "*.{ts,js}")],
-				namingStrategy: new SnakeNamingStrategy(),
-			}),
+			useFactory: typeOrmOptions,
 			inject: [ConfigService],
 		}),
 		HealthModule,
 		IdentityModule,
 		CatalogModule,
 		SubscriptionsModule,
+		UsageModule,
 	],
 	providers: [
 		{ provide: APP_GUARD, useClass: JwtAuthGuard },

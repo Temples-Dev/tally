@@ -21,14 +21,19 @@ import {
 } from "@nestjs/swagger";
 import {
 	Allow,
+	IsArray,
+	IsBoolean,
 	IsDateString,
 	IsEnum,
+	IsInt,
 	IsOptional,
 	IsString,
 	IsUUID,
 	MaxLength,
+	Min,
 	MinLength,
 } from "class-validator";
+import { AggregationMethod, EntitlementValueType } from "./enums";
 
 import { CurrentTenantId } from "../identity/decorators";
 import { MemberRole } from "../identity/enums";
@@ -38,7 +43,6 @@ import { TenantGuard } from "../identity/tenant.guard";
 import { SubscriptionsService } from "../subscriptions/subscriptions.service";
 // biome-ignore lint/style/useImportType: injected tokens must be value imports for decorator metadata.
 import { CatalogService } from "./catalog.service";
-import { EntitlementValueType } from "./enums";
 
 export class CreateProductDto {
 	@IsString()
@@ -107,6 +111,29 @@ export class CreateMeterDto {
 	@MinLength(1)
 	@MaxLength(32)
 	unit: string;
+
+	@IsOptional()
+	@IsEnum(AggregationMethod)
+	aggregationMethod?: AggregationMethod;
+
+	@IsOptional()
+	@IsBoolean()
+	allowsNegative?: boolean;
+
+	@IsOptional()
+	@IsInt()
+	@Min(0)
+	maxEventAgeSeconds?: number | null;
+
+	@IsOptional()
+	@IsInt()
+	@Min(0)
+	maxFutureSkewSeconds?: number;
+
+	@IsOptional()
+	@IsArray()
+	@IsString({ each: true })
+	allowedDimensions?: string[] | null;
 }
 
 export class CreateDefinitionDto {

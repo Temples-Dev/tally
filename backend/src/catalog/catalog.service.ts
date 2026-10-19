@@ -15,6 +15,7 @@ import { Plan } from "./entities/plan.entity";
 import { Product } from "./entities/product.entity";
 import { UsageMetric } from "./entities/usage-metric.entity";
 import {
+	type AggregationMethod,
 	DefinitionStatus,
 	type EntitlementValueType,
 	PlanStatus,
@@ -279,7 +280,16 @@ export class CatalogService {
 
 	async createMeter(
 		tenantId: string,
-		input: { code: string; name: string; unit: string },
+		input: {
+			code: string;
+			name: string;
+			unit: string;
+			aggregationMethod?: AggregationMethod;
+			allowsNegative?: boolean;
+			maxEventAgeSeconds?: number | null;
+			maxFutureSkewSeconds?: number;
+			allowedDimensions?: string[] | null;
+		},
 	): Promise<UsageMetric> {
 		try {
 			return await this.meters.save(this.meters.create({ tenantId, ...input }));

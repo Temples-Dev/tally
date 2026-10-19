@@ -20,6 +20,13 @@ export enum MeterStatus {
 	ARCHIVED = "archived",
 }
 
+export enum AggregationMethod {
+	SUM = "sum",
+	COUNT = "count",
+	MAX = "max",
+	LAST = "last",
+}
+
 export enum EntitlementValueType {
 	BOOLEAN = "boolean",
 	INTEGER = "integer",

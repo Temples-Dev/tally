@@ -1,0 +1,385 @@
+import {
+	ConflictException,
+	HttpException,
+	Injectable,
+	Logger,
+	NotFoundException,
+	UnprocessableEntityException,
+} from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { plainToInstance } from "class-transformer";
+import { validate } from "class-validator";
+import type { Repository } from "typeorm";
+
+import { UsageMetric } from "../catalog/entities/usage-metric.entity";
+import { MeterStatus } from "../catalog/enums";
+import { isUniqueViolation } from "../common/database-errors";
+import { CustomerAccount } from "../subscriptions/entities/customer-account.entity";
+import { Subscription } from "../subscriptions/entities/subscription.entity";
+import { UsageEvent } from "./entities/usage-event.entity";
+import { UsageEventStatus } from "./enums";
+import {
+	hashUsagePayload,
+	isNegativeQuantity,
+	normalizeQuantity,
+	validateDimensions,
+} from "./usage-payload";
+import { IngestUsageEventDto, type ListUsageEventsQueryDto } from "./usage.dto";
+
+export interface IngestOutcome {
+	status: "accepted" | "duplicate";
+	event: UsageEvent;
+}
+
+export interface BatchEventResult {
+	index: number;
+	externalEventId: string | null;
+	status: "accepted" | "duplicate" | "rejected";
+	eventId?: string;
+	reason?: string;
+}
+
+export interface UsageEventBody {
+	id: string;
+	externalEventId: string;
+	source: string;
+	customerAccountId: string;
+	subscriptionId: string | null;
+	metricId: string;
+	quantity: string;
+	dimensions: Record<string, unknown>;
+	occurredAt: string;
+	receivedAt: string;
+	status: UsageEventStatus;
+}
+
+@Injectable()
+export class UsageService {
+	private readonly logger = new Logger(UsageService.name);
+
+	constructor(
+		@InjectRepository(UsageEvent)
+		private readonly events: Repository<UsageEvent>,
+		@InjectRepository(UsageMetric)
+		private readonly metrics: Repository<UsageMetric>,
+		@InjectRepository(CustomerAccount)
+		private readonly customers: Repository<CustomerAccount>,
+		@InjectRepository(Subscription)
+		private readonly subscriptions: Repository<Subscription>,
+	) {}
+
+	async ingest(
+		tenantId: string,
+		dto: IngestUsageEventDto,
+	): Promise<IngestOutcome> {
+		const quantity = normalizeQuantity(dto.quantity);
+		if (quantity === null) {
+			throw new UnprocessableEntityException(
+				"quantity is outside the supported decimal range.",
+			);
+		}
+		const occurredAt = new Date(dto.occurredAt);
+		if (Number.isNaN(occurredAt.getTime())) {
+			throw new UnprocessableEntityException("occurredAt is invalid.");
+		}
+
+		const [metric, customer, subscription] = await Promise.all([
+			this.metrics.findOneBy({ tenantId, id: dto.metricId }),
+			this.customers.findOneBy({ tenantId, id: dto.customerAccountId }),
+			dto.subscriptionId === undefined
+				? Promise.resolve(null)
+				: this.subscriptions.findOneBy({
+						tenantId,
+						id: dto.subscriptionId,
+					}),
+		]);
+		if (metric === null || metric.status !== MeterStatus.ACTIVE) {
+			throw new NotFoundException("Usage metric not found.");
+		}
+		if (customer === null) {
+			throw new NotFoundException("Customer account not found.");
+		}
+		if (dto.subscriptionId !== undefined) {
+			if (
+				subscription === null ||
+				subscription.customerAccountId !== customer.id
+			) {
+				throw new UnprocessableEntityException(
+					"The subscription does not belong to the customer.",
+				);
+			}
+		}
+
+		const dimensions = dto.dimensions ?? {};
+		const dimensionsProblem = validateDimensions(
+			dimensions,
+			metric.allowedDimensions,
+		);
+		if (dimensionsProblem !== null) {
+			throw new UnprocessableEntityException(dimensionsProblem);
+		}
+
+		const now = new Date();
+		if (
+			occurredAt.getTime() >
+			now.getTime() + metric.maxFutureSkewSeconds * 1000
+		) {
+			throw new UnprocessableEntityException(
+				"occurredAt is too far in the future.",
+			);
+		}
+		if (
+			metric.maxEventAgeSeconds !== null &&
+			occurredAt.getTime() < now.getTime() - metric.maxEventAgeSeconds * 1000
+		) {
+			throw new UnprocessableEntityException(
+				"occurredAt is older than the metric's accepted window.",
+			);
+		}
+		if (isNegativeQuantity(quantity) && !metric.allowsNegative) {
+			throw new UnprocessableEntityException(
+				"This metric does not allow negative quantities.",
+			);
+		}
+
+		const payloadHash = hashUsagePayload({
+			customerAccountId: customer.id,
+			subscriptionId: subscription?.id ?? null,
+			metricId: metric.id,
+			quantity,
+			occurredAt,
+			dimensions,
+		});
+
+		try {
+			const event = await this.events.save(
+				this.events.create({
+					tenantId,
+					source: dto.source,
+					externalEventId: dto.externalEventId,
+					customerAccountId: customer.id,
+					subscriptionId: subscription?.id ?? null,
+					metricId: metric.id,
+					quantity,
+					dimensions,
+					occurredAt,
+					receivedAt: now,
+					payloadHash,
+					status: UsageEventStatus.ACCEPTED,
+				}),
+			);
+			return { status: "accepted", event };
+		} catch (error) {
+			if (!isUniqueViolation(error)) {
+				throw error;
+			}
+			const existing = await this.events.findOneBy({
+				tenantId,
+				source: dto.source,
+				externalEventId: dto.externalEventId,
+			});
+			if (existing === null) {
+				throw error;
+			}
+			if (existing.payloadHash !== payloadHash) {
+				throw new ConflictException(
+					"This externalEventId was already accepted with a different payload.",
+				);
+			}
+			return { status: "duplicate", event: existing };
+		}
+	}
+
+	async ingestBatch(
+		tenantId: string,
+		rawEvents: unknown[],
+	): Promise<BatchEventResult[]> {
+		const results: BatchEventResult[] = [];
+		for (let index = 0; index < rawEvents.length; index += 1) {
+			const raw = rawEvents[index];
+			const dto = plainToInstance(IngestUsageEventDto, raw);
+			const errors = await validate(dto, {
+				whitelist: true,
+				forbidNonWhitelisted: true,
+				forbidUnknownValues: false,
+			});
+			if (errors.length > 0) {
+				results.push({
+					index,
+					externalEventId:
+						typeof (raw as { externalEventId?: unknown })?.externalEventId ===
+						"string"
+							? (raw as { externalEventId: string }).externalEventId
+							: null,
+					status: "rejected",
+					reason: this.firstMessage(errors),
+				});
+				continue;
+			}
+			try {
+				const outcome = await this.ingest(tenantId, dto);
+				results.push({
+					index,
+					externalEventId: dto.externalEventId,
+					status: outcome.status,
+					eventId: outcome.event.id,
+				});
+			} catch (error) {
+				if (!(error instanceof HttpException)) {
+					this.logger.error(
+						`Batch usage ingestion failed at index ${index}: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+					);
+				}
+				results.push({
+					index,
+					externalEventId: dto.externalEventId,
+					status: "rejected",
+					reason:
+						error instanceof HttpException
+							? error.message
+							: "The event could not be recorded.",
+				});
+			}
+		}
+		return results;
+	}
+
+	async getEvent(tenantId: string, id: string): Promise<UsageEventBody> {
+		const event = await this.events.findOneBy({ tenantId, id });
+		if (event === null) {
+			throw new NotFoundException("Usage event not found.");
+		}
+		return this.toBody(event);
+	}
+
+	async listEvents(
+		tenantId: string,
+		query: ListUsageEventsQueryDto,
+	): Promise<{
+		data: UsageEventBody[];
+		pagination: { nextCursor: string | null; hasMore: boolean };
+	}> {
+		const limit = query.limit ?? 50;
+		const from = query.from === undefined ? null : new Date(query.from);
+		const to = query.to === undefined ? null : new Date(query.to);
+		if (from !== null && to !== null && from.getTime() >= to.getTime()) {
+			throw new UnprocessableEntityException("from must be earlier than to.");
+		}
+
+		const builder = this.events
+			.createQueryBuilder("event")
+			.where("event.tenant_id = :tenantId", { tenantId })
+			.orderBy("event.occurred_at", "DESC")
+			.addOrderBy("event.id", "DESC")
+			.take(limit + 1);
+
+		if (query.metricId !== undefined) {
+			builder.andWhere("event.metric_id = :metricId", {
+				metricId: query.metricId,
+			});
+		}
+		if (query.customerAccountId !== undefined) {
+			builder.andWhere("event.customer_account_id = :customerAccountId", {
+				customerAccountId: query.customerAccountId,
+			});
+		}
+		if (query.subscriptionId !== undefined) {
+			builder.andWhere("event.subscription_id = :subscriptionId", {
+				subscriptionId: query.subscriptionId,
+			});
+		}
+		if (from !== null) {
+			builder.andWhere("event.occurred_at >= :from", { from });
+		}
+		if (to !== null) {
+			builder.andWhere("event.occurred_at < :to", { to });
+		}
+		if (query.cursor !== undefined) {
+			const cursor = this.decodeCursor(query.cursor);
+			builder.andWhere(
+				"(event.occurred_at, event.id) < (:cursorAt, :cursorId)",
+				{
+					cursorAt: cursor.occurredAt,
+					cursorId: cursor.id,
+				},
+			);
+		}
+
+		const rows = await builder.getMany();
+		const hasMore = rows.length > limit;
+		const page = hasMore ? rows.slice(0, limit) : rows;
+		const last = page[page.length - 1];
+		return {
+			data: page.map((event) => this.toBody(event)),
+			pagination: {
+				hasMore,
+				nextCursor:
+					hasMore && last !== undefined ? this.encodeCursor(last) : null,
+			},
+		};
+	}
+
+	private encodeCursor(event: UsageEvent): string {
+		return Buffer.from(
+			JSON.stringify({
+				occurredAt: event.occurredAt.toISOString(),
+				id: event.id,
+			}),
+			"utf8",
+		).toString("base64url");
+	}
+
+	private decodeCursor(cursor: string): { occurredAt: Date; id: string } {
+		try {
+			const parsed = JSON.parse(
+				Buffer.from(cursor, "base64url").toString("utf8"),
+			) as { occurredAt?: unknown; id?: unknown };
+			if (
+				typeof parsed.occurredAt !== "string" ||
+				typeof parsed.id !== "string"
+			) {
+				throw new Error("Invalid cursor shape.");
+			}
+			const occurredAt = new Date(parsed.occurredAt);
+			if (Number.isNaN(occurredAt.getTime())) {
+				throw new Error("Invalid cursor timestamp.");
+			}
+			return { occurredAt, id: parsed.id };
+		} catch {
+			throw new UnprocessableEntityException("cursor is invalid.");
+		}
+	}
+
+	toBody(event: UsageEvent): UsageEventBody {
+		return {
+			id: event.id,
+			externalEventId: event.externalEventId,
+			source: event.source,
+			customerAccountId: event.customerAccountId,
+			subscriptionId: event.subscriptionId,
+			metricId: event.metricId,
+			quantity: event.quantity,
+			dimensions: event.dimensions,
+			occurredAt: event.occurredAt.toISOString(),
+			receivedAt: event.receivedAt.toISOString(),
+			status: event.status,
+		};
+	}
+
+	private firstMessage(
+		errors: Array<{
+			constraints?: Record<string, string>;
+			children?: unknown[];
+		}>,
+	): string {
+		for (const error of errors) {
+			const messages = Object.values(error.constraints ?? {});
+			if (messages.length > 0) {
+				return messages[0];
+			}
+		}
+		return "The event is invalid.";
+	}
+}

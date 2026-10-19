@@ -9,6 +9,8 @@ export interface EnvironmentVariables {
 	AUTH_JWT_SECRET: string;
 	AUTH_JWT_ISSUER?: string;
 	AUTH_JWT_AUDIENCE?: string;
+	JOB_POLL_INTERVAL_MS: number;
+	JOB_LOCK_TIMEOUT_MS: number;
 }
 
 const isLocal = Joi.valid("development", "test");
@@ -36,6 +38,8 @@ export const environmentSchema = Joi.object<EnvironmentVariables>({
 	}),
 	AUTH_JWT_ISSUER: Joi.string().optional(),
 	AUTH_JWT_AUDIENCE: Joi.string().optional(),
+	JOB_POLL_INTERVAL_MS: Joi.number().integer().min(50).default(1000),
+	JOB_LOCK_TIMEOUT_MS: Joi.number().integer().min(1000).default(300000),
 }).unknown();
 
 export function validateEnvironment(

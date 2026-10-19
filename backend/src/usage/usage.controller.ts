@@ -25,11 +25,14 @@ import { CurrentTenantId } from "../identity/decorators";
 import { MemberRole } from "../identity/enums";
 import { Roles } from "../identity/roles.decorator";
 import { TenantGuard } from "../identity/tenant.guard";
+// biome-ignore lint/style/useImportType: injected tokens must be value imports for decorator metadata.
+import { UsageOperationsService } from "./usage-operations.service";
 // biome-ignore lint/style/useImportType: DTO classes must be value imports for decorator metadata.
 import {
 	IngestUsageBatchDto,
 	IngestUsageEventDto,
 	ListUsageEventsQueryDto,
+	UsageProcessingStatusQueryDto,
 	UsageSummaryQueryDto,
 } from "./usage.dto";
 // biome-ignore lint/style/useImportType: injected tokens must be value imports for decorator metadata.
@@ -47,7 +50,10 @@ function requireTenant(tenantId: string | undefined): string {
 @Controller()
 @UseGuards(TenantGuard)
 export class UsageController {
-	constructor(private readonly usage: UsageService) {}
+	constructor(
+		private readonly usage: UsageService,
+		private readonly operations: UsageOperationsService,
+	) {}
 
 	@Post("usage/events")
 	@Roles(MemberRole.OWNER, MemberRole.ADMINISTRATOR, MemberRole.DEVELOPER)
@@ -103,6 +109,26 @@ export class UsageController {
 		@CurrentTenantId() tenantId?: string,
 	) {
 		return this.usage.summary(requireTenant(tenantId), query);
+	}
+
+	@Get("usage/processing-status")
+	@ApiOperation({ summary: "Inspect usage aggregation backlog and freshness" })
+	@ApiOkResponse({ description: "Processing status" })
+	processingStatus(
+		@Query() query: UsageProcessingStatusQueryDto,
+		@CurrentTenantId() tenantId?: string,
+	) {
+		return this.operations.processingStatus(requireTenant(tenantId), query);
+	}
+
+	@Get("usage/reconciliation")
+	@ApiOperation({ summary: "Compare source events against aggregates" })
+	@ApiOkResponse({ description: "Reconciliation result" })
+	reconciliation(
+		@Query() query: UsageSummaryQueryDto,
+		@CurrentTenantId() tenantId?: string,
+	) {
+		return this.operations.reconciliation(requireTenant(tenantId), query);
 	}
 
 	@Get("usage/events/:id")

@@ -60,6 +60,12 @@ export class IngestUsageBatchDto {
 	events: unknown[];
 }
 
+export class UsageProcessingStatusQueryDto {
+	@IsOptional()
+	@IsUUID()
+	metricId?: string;
+}
+
 export class UsageSummaryQueryDto {
 	@IsUUID()
 	metricId: string;

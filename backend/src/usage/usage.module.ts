@@ -8,6 +8,7 @@ import { CustomerAccount } from "../subscriptions/entities/customer-account.enti
 import { Subscription } from "../subscriptions/entities/subscription.entity";
 import { UsageAggregate } from "./entities/usage-aggregate.entity";
 import { UsageEvent } from "./entities/usage-event.entity";
+import { UsageOperationsService } from "./usage-operations.service";
 import { UsageController } from "./usage.controller";
 import { UsageService } from "./usage.service";
 
@@ -24,7 +25,7 @@ import { UsageService } from "./usage.service";
 		JobsModule,
 	],
 	controllers: [UsageController],
-	providers: [UsageService],
+	providers: [UsageService, UsageOperationsService],
 	exports: [UsageService],
 })
 export class UsageModule {}

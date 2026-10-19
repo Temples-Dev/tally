@@ -33,6 +33,7 @@ import {
 	normalizeQuantity,
 	validateDimensions,
 } from "./usage-payload";
+import { parseUtcDayRange } from "./usage-range";
 import {
 	IngestUsageEventDto,
 	type ListUsageEventsQueryDto,
@@ -391,22 +392,7 @@ export class UsageService {
 		tenantId: string,
 		query: UsageSummaryQueryDto,
 	): Promise<UsageSummaryBody> {
-		const from = new Date(query.from);
-		const to = new Date(query.to);
-		const dayMs = 86_400_000;
-		if (from.getTime() >= to.getTime()) {
-			throw new UnprocessableEntityException("from must be earlier than to.");
-		}
-		if (from.getTime() % dayMs !== 0 || to.getTime() % dayMs !== 0) {
-			throw new UnprocessableEntityException(
-				"from and to must be UTC day boundaries.",
-			);
-		}
-		if (to.getTime() - from.getTime() > 366 * dayMs) {
-			throw new UnprocessableEntityException(
-				"The summary range must not exceed 366 days.",
-			);
-		}
+		const { from, to } = parseUtcDayRange(query.from, query.to);
 
 		const metric = await this.metrics.findOneBy({
 			tenantId,

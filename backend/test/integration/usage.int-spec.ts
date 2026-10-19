@@ -1,4 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 
 import type { INestApplication } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
@@ -12,6 +13,8 @@ import { DataSource } from "typeorm";
 import { configureApp } from "../../src/app-setup";
 import { TenantMember } from "../../src/identity/entities/tenant-member.entity";
 import { MemberRole, MemberStatus } from "../../src/identity/enums";
+import { JobRunnerModule } from "../../src/jobs/job-runner.module";
+import { UsageAggregationModule } from "../../src/usage/aggregation/usage-aggregation.module";
 
 jest.setTimeout(180_000);
 
@@ -44,6 +47,7 @@ describe("Usage metering ingestion (integration)", () => {
 	let customerA2 = "";
 	let customerB = "";
 	let subscriptionA = "";
+	let aggregationMetricId = "";
 	let acceptedEventId = "";
 	let acceptedOccurredAt = "";
 
@@ -54,10 +58,11 @@ describe("Usage metering ingestion (integration)", () => {
 		process.env.DATABASE_URL = container.getConnectionUri();
 		process.env.CORS_ORIGINS = "http://localhost:5173";
 		process.env.AUTH_JWT_SECRET = JWT_SECRET;
+		process.env.JOB_POLL_INTERVAL_MS = "50";
 
 		const { AppModule } = await import("../../src/app.module");
 		const moduleRef = await Test.createTestingModule({
-			imports: [AppModule],
+			imports: [AppModule, UsageAggregationModule, JobRunnerModule],
 		}).compile();
 
 		app = moduleRef.createNestApplication({ logger: false });
@@ -100,6 +105,14 @@ describe("Usage metering ingestion (integration)", () => {
 		customerA = await createCustomer(tenantA, alice, "Acme API");
 		customerA2 = await createCustomer(tenantA, alice, "Acme Secondary");
 		customerB = await createCustomer(tenantB, bob, "Beta API");
+
+		const aggregationMetric = await api(alice, tenantA).post("/meters").send({
+			code: "agg.requests",
+			name: "Aggregated requests",
+			unit: "request",
+		});
+		expect(aggregationMetric.status).toBe(201);
+		aggregationMetricId = aggregationMetric.body.id as string;
 
 		const product = await api(alice, tenantA)
 			.post("/products")
@@ -342,6 +355,190 @@ describe("Usage metering ingestion (integration)", () => {
 			`/usage/events/${randomUUID()}`,
 		);
 		expect(missing.status).toBe(404);
+	});
+
+	function utcStart(ms: number): Date {
+		const value = new Date(ms);
+		return new Date(
+			Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()),
+		);
+	}
+
+	interface SummaryBody {
+		total: string | null;
+		eventCount: number;
+		metric: { unit: string; aggregationMethod: string };
+		aggregates: Array<{ revision: number }>;
+		freshness: { lastCalculatedAt: string | null };
+	}
+
+	async function waitForSummary(
+		metric: string,
+		from: Date,
+		to: Date,
+		expectedTotal: string,
+		expectedCount: number,
+	): Promise<SummaryBody> {
+		const deadline = Date.now() + 20_000;
+		let lastBody: unknown;
+		while (Date.now() < deadline) {
+			const response = await api(alice, tenantA).get(
+				`/usage/summary?metricId=${metric}&from=${encodeURIComponent(
+					from.toISOString(),
+				)}&to=${encodeURIComponent(to.toISOString())}`,
+			);
+			lastBody = response.body;
+			const body = response.body as SummaryBody;
+			if (
+				response.status === 200 &&
+				body.total === expectedTotal &&
+				body.eventCount === expectedCount
+			) {
+				return body;
+			}
+			await delay(50);
+		}
+		throw new Error(
+			`Timed out waiting for summary ${expectedTotal}: ${JSON.stringify(lastBody)}`,
+		);
+	}
+
+	it("aggregates events and re-aggregates late arrivals", async () => {
+		const now = Date.now();
+		const base = now - 5 * 60_000;
+		const from = utcStart(base);
+		const to = new Date(utcStart(now).getTime() + 86_400_000);
+
+		const first = await api(alice, tenantA)
+			.post("/usage/events")
+			.send({
+				externalEventId: "evt-agg-1",
+				source: "aggregation-test",
+				customerAccountId: customerA,
+				metricId: aggregationMetricId,
+				quantity: "1.25",
+				occurredAt: new Date(base).toISOString(),
+			});
+		expect(first.status).toBe(201);
+
+		const second = await api(alice, tenantA)
+			.post("/usage/events")
+			.send({
+				externalEventId: "evt-agg-2",
+				source: "aggregation-test",
+				customerAccountId: customerA,
+				metricId: aggregationMetricId,
+				quantity: "2",
+				occurredAt: new Date(base + 1_000).toISOString(),
+			});
+		expect(second.status).toBe(201);
+
+		const duplicate = await api(alice, tenantA)
+			.post("/usage/events")
+			.send({
+				externalEventId: "evt-agg-1",
+				source: "aggregation-test",
+				customerAccountId: customerA,
+				metricId: aggregationMetricId,
+				quantity: "1.25",
+				occurredAt: new Date(base).toISOString(),
+			});
+		expect(duplicate.status).toBe(200);
+
+		const initial = await waitForSummary(
+			aggregationMetricId,
+			from,
+			to,
+			"3.25",
+			2,
+		);
+		expect(initial.metric.unit).toBe("request");
+		expect(initial.metric.aggregationMethod).toBe("sum");
+		expect(initial.freshness.lastCalculatedAt).toBeTruthy();
+
+		const late = await api(alice, tenantA)
+			.post("/usage/events")
+			.send({
+				externalEventId: "evt-agg-3",
+				source: "aggregation-test",
+				customerAccountId: customerA,
+				metricId: aggregationMetricId,
+				quantity: "0.75",
+				occurredAt: new Date(base + 2_000).toISOString(),
+			});
+		expect(late.status).toBe(201);
+
+		const updated = await waitForSummary(aggregationMetricId, from, to, "4", 3);
+		expect(updated.aggregates.some((aggregate) => aggregate.revision > 1)).toBe(
+			true,
+		);
+
+		const misaligned = await api(alice, tenantA).get(
+			`/usage/summary?metricId=${aggregationMetricId}&from=${encodeURIComponent(
+				new Date(from.getTime() + 3_600_000).toISOString(),
+			)}&to=${encodeURIComponent(to.toISOString())}`,
+		);
+		expect(misaligned.status).toBe(422);
+	});
+
+	it("applies count, max, and last aggregation methods", async () => {
+		const now = Date.now();
+		const base = now - 5 * 60_000;
+		const from = utcStart(base);
+		const to = new Date(utcStart(now).getTime() + 86_400_000);
+
+		async function createMetric(
+			code: string,
+			aggregationMethod: string,
+		): Promise<string> {
+			const response = await api(alice, tenantA).post("/meters").send({
+				code,
+				name: code,
+				unit: "unit",
+				aggregationMethod,
+			});
+			expect(response.status).toBe(201);
+			return response.body.id as string;
+		}
+
+		const countMetric = await createMetric("agg.count", "count");
+		const maxMetric = await createMetric("agg.max", "max");
+		const lastMetric = await createMetric("agg.last", "last");
+
+		for (const [metricId, suffix] of [
+			[countMetric, "count"],
+			[maxMetric, "max"],
+			[lastMetric, "last"],
+		] as const) {
+			await api(alice, tenantA)
+				.post("/usage/events")
+				.send({
+					externalEventId: `evt-${suffix}-1`,
+					source: "aggregation-test",
+					customerAccountId: customerA,
+					metricId,
+					quantity: "7",
+					occurredAt: new Date(base).toISOString(),
+				});
+			await api(alice, tenantA)
+				.post("/usage/events")
+				.send({
+					externalEventId: `evt-${suffix}-2`,
+					source: "aggregation-test",
+					customerAccountId: customerA,
+					metricId,
+					quantity: "5",
+					occurredAt: new Date(base + 1_000).toISOString(),
+				});
+		}
+
+		expect((await waitForSummary(countMetric, from, to, "2", 2)).total).toBe(
+			"2",
+		);
+		expect((await waitForSummary(maxMetric, from, to, "7", 2)).total).toBe("7");
+		expect((await waitForSummary(lastMetric, from, to, "5", 2)).total).toBe(
+			"5",
+		);
 	});
 
 	it("enforces roles and tenant isolation", async () => {

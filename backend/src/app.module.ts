@@ -15,6 +15,7 @@ import { typeOrmOptions } from "./database/typeorm-options";
 import { HealthModule } from "./health/health.module";
 import { IdentityModule } from "./identity/identity.module";
 import { JwtAuthGuard } from "./identity/jwt-auth.guard";
+import { QuotasModule } from "./quotas/quotas.module";
 import { SubscriptionsModule } from "./subscriptions/subscriptions.module";
 import { UsageModule } from "./usage/usage.module";
 
@@ -34,6 +35,7 @@ import { UsageModule } from "./usage/usage.module";
 		CatalogModule,
 		SubscriptionsModule,
 		UsageModule,
+		QuotasModule,
 	],
 	providers: [
 		{ provide: APP_GUARD, useClass: JwtAuthGuard },

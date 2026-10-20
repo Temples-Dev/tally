@@ -496,6 +496,8 @@ The interface must support operations such as:
 
 Provider-specific behavior belongs in adapter implementations.
 
+Credentials belong to the tenant, not the platform. Each tenant connects its own provider account. Secret keys must be encrypted at rest with an application-held encryption key, must never be returned by an API, and must never appear in logs or audit metadata.
+
 ### 10.2 Payment workflow
 
 A typical payment workflow is:

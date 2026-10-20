@@ -6,6 +6,7 @@ import { BillingModule } from "./billing/billing.module";
 import { validateEnvironment } from "./config/environment.validation";
 import { typeOrmOptions } from "./database/typeorm-options";
 import { JobRunnerModule } from "./jobs/job-runner.module";
+import { PaymentsModule } from "./payments/payments.module";
 import { QuotasModule } from "./quotas/quotas.module";
 import { UsageAggregationModule } from "./usage/aggregation/usage-aggregation.module";
 import { WorkerHealthModule } from "./worker/worker-health.module";
@@ -25,6 +26,7 @@ import { WorkerHealthModule } from "./worker/worker-health.module";
 		UsageAggregationModule,
 		QuotasModule,
 		BillingModule,
+		PaymentsModule,
 		WorkerHealthModule,
 	],
 })

@@ -595,6 +595,18 @@ Authorized administrative operations must use dedicated endpoints, reason codes,
 
 ## 15. Payment endpoints
 
+### 15.0 Provider account configuration
+
+`POST /v1/payment-provider-accounts`
+
+Permission: tenant owner or administrator.
+
+Connects or rotates the tenant's payment-provider credentials. Secret keys are write-only: the API stores them encrypted and returns only a safe account summary and the last four characters of the secret.
+
+`GET /v1/payment-provider-accounts`
+
+Returns connected provider accounts without credentials.
+
 ### 15.1 Initiate payment
 
 `POST /v1/invoices/{invoiceId}/payments`

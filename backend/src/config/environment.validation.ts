@@ -11,6 +11,8 @@ export interface EnvironmentVariables {
 	AUTH_JWT_AUDIENCE?: string;
 	JOB_POLL_INTERVAL_MS: number;
 	JOB_LOCK_TIMEOUT_MS: number;
+	PAYMENT_CREDENTIALS_ENCRYPTION_KEY?: string;
+	PAYSTACK_BASE_URL: string;
 }
 
 const isLocal = Joi.valid("development", "test");
@@ -40,6 +42,14 @@ export const environmentSchema = Joi.object<EnvironmentVariables>({
 	AUTH_JWT_AUDIENCE: Joi.string().optional(),
 	JOB_POLL_INTERVAL_MS: Joi.number().integer().min(50).default(1000),
 	JOB_LOCK_TIMEOUT_MS: Joi.number().integer().min(1000).default(300000),
+	PAYMENT_CREDENTIALS_ENCRYPTION_KEY: Joi.when("NODE_ENV", {
+		is: isLocal,
+		then: Joi.string().optional(),
+		otherwise: Joi.string().required(),
+	}),
+	PAYSTACK_BASE_URL: Joi.string()
+		.uri({ scheme: ["http", "https"] })
+		.default("https://api.paystack.co"),
 }).unknown();
 
 export function validateEnvironment(

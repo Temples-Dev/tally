@@ -43,6 +43,7 @@ describe("Billing and invoicing (integration)", () => {
 	let metricId = "";
 	let periodId = "";
 	let invoiceId = "";
+	let customerId = "";
 
 	beforeAll(async () => {
 		container = await new PostgreSqlContainer("postgres:16-alpine").start();
@@ -100,6 +101,7 @@ describe("Billing and invoicing (integration)", () => {
 			.post("/customers")
 			.send({ displayName: "Initech", email: "billing@initech.test" });
 		expect(customer.status).toBe(201);
+		customerId = customer.body.id as string;
 		const subscription = await api(alice, tenantA).post("/subscriptions").send({
 			customerAccountId: customer.body.id,
 			planVersionId: version.body.id,
@@ -422,6 +424,352 @@ describe("Billing and invoicing (integration)", () => {
 		expect(otherList.body).toHaveLength(0);
 	});
 
+	it("lists billing periods with invoice state and exposes billing operations", async () => {
+		const periods = await api(alice, tenantA).get("/billing-periods");
+		expect(periods.status).toBe(200);
+		expect(periods.body).toHaveLength(2);
+		expect(periods.body[0]).toMatchObject({
+			subscriptionId,
+			status: "invoiced",
+			invoiceStatus: "open",
+		});
+		expect(typeof periods.body[0].invoiceId).toBe("string");
+
+		const filtered = await api(alice, tenantA).get(
+			"/billing-periods?status=open",
+		);
+		expect(filtered.status).toBe(200);
+		expect(filtered.body).toHaveLength(0);
+
+		const invalid = await api(alice, tenantA).get(
+			"/billing-periods?status=not-a-status",
+		);
+		expect(invalid.status).toBe(400);
+
+		const operations = await dataSource.query(
+			"SELECT id FROM billing_operations WHERE tenant_id = $1 ORDER BY created_at LIMIT 1",
+			[tenantA],
+		);
+		const operation = await api(alice, tenantA).get(
+			`/billing-operations/${operations[0].id}`,
+		);
+		expect(operation.status).toBe(200);
+		expect(operation.body).toMatchObject({
+			operationType: "billing.invoice.generate",
+			status: "completed",
+			invoiceId,
+		});
+
+		const missing = await api(alice, tenantA).get(
+			"/billing-operations/00000000-0000-4000-8000-000000000000",
+		);
+		expect(missing.status).toBe(404);
+	});
+
+	it("applies pending adjustments to the next invoice", async () => {
+		const adjustment = await api(alice, tenantA)
+			.post("/billing-adjustments")
+			.send({
+				customerAccountId: customerId,
+				subscriptionId,
+				adjustmentType: "credit",
+				amount: "5",
+				currency: "USD",
+				reason: "Service credit",
+				idempotencyKey: "credit-service-1",
+			});
+		expect(adjustment.status).toBe(201);
+		expect(adjustment.body).toMatchObject({
+			status: "pending",
+			amount: "5",
+			currency: "USD",
+			adjustmentType: "credit",
+			reason: "Service credit",
+		});
+		const adjustmentId = adjustment.body.id as string;
+
+		const duplicate = await api(alice, tenantA)
+			.post("/billing-adjustments")
+			.send({
+				customerAccountId: customerId,
+				subscriptionId,
+				adjustmentType: "credit",
+				amount: "5",
+				currency: "USD",
+				reason: "Service credit",
+				idempotencyKey: "credit-service-1",
+			});
+		expect(duplicate.status).toBe(201);
+		expect(duplicate.body.id).toBe(adjustmentId);
+
+		const conflict = await api(alice, tenantA)
+			.post("/billing-adjustments")
+			.send({
+				customerAccountId: customerId,
+				subscriptionId,
+				adjustmentType: "debit",
+				amount: "5",
+				currency: "USD",
+				reason: "Service credit",
+				idempotencyKey: "credit-service-1",
+			});
+		expect(conflict.status).toBe(409);
+
+		const zero = await api(alice, tenantA).post("/billing-adjustments").send({
+			customerAccountId: customerId,
+			adjustmentType: "credit",
+			amount: "0.001",
+			currency: "USD",
+			reason: "Rounds away",
+			idempotencyKey: "credit-zero",
+		});
+		expect(zero.status).toBe(422);
+
+		const listed = await api(alice, tenantA).get(
+			"/billing-adjustments?status=pending",
+		);
+		expect(listed.status).toBe(200);
+		expect(listed.body).toHaveLength(1);
+
+		const period = await api(alice, tenantA).post("/billing-periods").send({
+			subscriptionId,
+			periodStart: "2026-11-01T00:00:00.000Z",
+			periodEnd: "2026-12-01T00:00:00.000Z",
+		});
+		expect(period.status).toBe(201);
+		const queued = await api(alice, tenantA).post(
+			`/billing-periods/${period.body.id}/invoice`,
+		);
+		expect(queued.status).toBe(202);
+		const invoice = await waitForPeriodInvoice(period.body.id);
+		expect(invoice).toMatchObject({
+			subtotal: "45.74",
+			total: "45.74",
+			amountDue: "45.74",
+		});
+
+		const operation = await waitForOperation(queued.body.operationId as string);
+		expect(operation).toMatchObject({
+			status: "completed",
+			invoiceId: invoice.id,
+			attemptCount: 1,
+		});
+
+		const lines = await api(alice, tenantA).get(
+			`/invoices/${invoice.id}/lines`,
+		);
+		expect(lines.status).toBe(200);
+		expect(lines.body).toHaveLength(4);
+		const creditLine = (
+			lines.body as Array<{
+				lineType: string;
+				amount: string;
+				metadata: Record<string, unknown>;
+			}>
+		).find((line) => line.lineType === "credit");
+		expect(creditLine).toMatchObject({
+			amount: "-5.0000",
+			metadata: { adjustmentId },
+		});
+
+		const applied = await api(alice, tenantA).get(
+			"/billing-adjustments?status=applied",
+		);
+		expect(applied.status).toBe(200);
+		expect(applied.body).toHaveLength(1);
+		expect(applied.body[0]).toMatchObject({
+			id: adjustmentId,
+			invoiceId: invoice.id,
+		});
+		expect(applied.body[0].appliedAt).toBeTruthy();
+	});
+
+	it("issues partial and full credit notes and blocks voiding credited invoices", async () => {
+		const invoiceLines = await api(alice, tenantA).get(
+			`/invoices/${invoiceId}/lines`,
+		);
+		const firstLineId = invoiceLines.body[0].id as string;
+		const partial = await api(alice, tenantA)
+			.post(`/invoices/${invoiceId}/credit-notes`)
+			.send({
+				amount: "2",
+				reason: "Partial refund",
+				lines: [
+					{
+						invoiceLineId: firstLineId,
+						description: "Partial refund",
+						amount: "2",
+					},
+				],
+			});
+		expect(partial.status).toBe(201);
+		expect(partial.body).toMatchObject({
+			invoiceId,
+			currency: "USD",
+			amount: "2",
+			status: "issued",
+		});
+		expect(partial.body.creditNoteNumber).toMatch(/^CN-\d{4}-000001$/);
+		expect(partial.body.lines).toHaveLength(1);
+		expect(partial.body.lines[0]).toMatchObject({
+			invoiceLineId: firstLineId,
+			amount: "2",
+		});
+		expect(partial.body.lines[0].id).toBeTruthy();
+		const creditNoteId = partial.body.id as string;
+
+		const afterPartial = await api(alice, tenantA).get(
+			`/invoices/${invoiceId}`,
+		);
+		expect(afterPartial.status).toBe(200);
+		expect(afterPartial.body).toMatchObject({
+			status: "open",
+			amountCredited: "2",
+			amountDue: "50.04",
+		});
+
+		const over = await api(alice, tenantA)
+			.post(`/invoices/${invoiceId}/credit-notes`)
+			.send({ amount: "100", reason: "Too much" });
+		expect(over.status).toBe(422);
+
+		const full = await api(alice, tenantA)
+			.post(`/invoices/${invoiceId}/credit-notes`)
+			.send({ amount: "50.04", reason: "Full refund" });
+		expect(full.status).toBe(201);
+		expect(full.body.creditNoteNumber).toMatch(/^CN-\d{4}-000002$/);
+
+		const credited = await api(alice, tenantA).get(`/invoices/${invoiceId}`);
+		expect(credited.body).toMatchObject({
+			status: "credited",
+			amountCredited: "52.04",
+			amountDue: "0",
+		});
+
+		const voidAttempt = await api(alice, tenantA)
+			.post(`/invoices/${invoiceId}/void`)
+			.send({ reason: "No longer needed" });
+		expect(voidAttempt.status).toBe(409);
+
+		const listed = await api(alice, tenantA).get(
+			`/credit-notes?invoiceId=${invoiceId}`,
+		);
+		expect(listed.status).toBe(200);
+		expect(listed.body).toHaveLength(2);
+
+		const retrieved = await api(alice, tenantA).get(
+			`/credit-notes/${creditNoteId}`,
+		);
+		expect(retrieved.status).toBe(200);
+		expect(retrieved.body.id).toBe(creditNoteId);
+
+		const isolation = await api(bob, tenantB).get(
+			`/credit-notes/${creditNoteId}`,
+		);
+		expect(isolation.status).toBe(404);
+	});
+
+	it("voids an open invoice", async () => {
+		const period = await api(alice, tenantA).post("/billing-periods").send({
+			subscriptionId,
+			periodStart: "2026-12-01T00:00:00.000Z",
+			periodEnd: "2027-01-01T00:00:00.000Z",
+		});
+		expect(period.status).toBe(201);
+		const queued = await api(alice, tenantA).post(
+			`/billing-periods/${period.body.id}/invoice`,
+		);
+		expect(queued.status).toBe(202);
+		const invoice = await waitForPeriodInvoice(period.body.id);
+
+		const voided = await api(alice, tenantA)
+			.post(`/invoices/${invoice.id}/void`)
+			.send({ reason: "Issued in error" });
+		expect(voided.status).toBe(200);
+		expect(voided.body).toMatchObject({
+			id: invoice.id,
+			status: "void",
+			amountDue: "0",
+		});
+
+		const repeat = await api(alice, tenantA)
+			.post(`/invoices/${invoice.id}/void`)
+			.send({ reason: "Again" });
+		expect(repeat.status).toBe(409);
+	});
+
+	it("runs reconciliation and records resolvable discrepancies", async () => {
+		const clean = await api(alice, tenantA).post(
+			"/billing/reconciliation-runs",
+		);
+		expect(clean.status).toBe(202);
+		expect(["running", "completed"]).toContain(clean.body.status);
+		const cleanRun = await waitForRun(clean.body.id as string);
+		expect(cleanRun).toMatchObject({
+			status: "completed",
+			invoicesChecked: 4,
+			discrepanciesFound: 0,
+			errorCode: null,
+		});
+		expect(cleanRun.completedAt).toBeTruthy();
+
+		await dataSource.query(
+			"UPDATE invoices SET subtotal = subtotal + 1 WHERE tenant_id = $1 AND id = $2",
+			[tenantA, invoiceId],
+		);
+
+		const dirty = await api(alice, tenantA).post(
+			"/billing/reconciliation-runs",
+		);
+		expect(dirty.status).toBe(202);
+		const dirtyRun = await waitForRun(dirty.body.id as string);
+		expect(dirtyRun.status).toBe("completed");
+		expect(dirtyRun.discrepanciesFound).toBeGreaterThanOrEqual(3);
+
+		const discrepancies = await api(alice, tenantA).get(
+			`/billing/discrepancies?runId=${dirtyRun.id}`,
+		);
+		expect(discrepancies.status).toBe(200);
+		const categories = new Set(
+			(
+				discrepancies.body as Array<{ category: string; resourceId: string }>
+			).map((row) => row.category),
+		);
+		expect(categories).toContain("LINE_TOTAL_MISMATCH");
+		expect(categories).toContain("INVOICE_TOTAL_MISMATCH");
+		expect(categories).toContain("BILLING_CALCULATION_MISMATCH");
+
+		const first = discrepancies.body[0] as { id: string };
+		const resolved = await api(alice, tenantA)
+			.post(`/billing/discrepancies/${first.id}/resolve`)
+			.send({ status: "resolved", note: "Corrected under ticket BIL-42" });
+		expect(resolved.status).toBe(200);
+		expect(resolved.body).toMatchObject({
+			status: "resolved",
+			resolutionNote: "Corrected under ticket BIL-42",
+		});
+
+		const again = await api(alice, tenantA)
+			.post(`/billing/discrepancies/${first.id}/resolve`)
+			.send({ status: "ignored", note: "Duplicate" });
+		expect(again.status).toBe(409);
+
+		const open = await api(alice, tenantA).get(
+			`/billing/discrepancies?runId=${dirtyRun.id}&status=open`,
+		);
+		expect(open.status).toBe(200);
+		expect(open.body).toHaveLength((dirtyRun.discrepanciesFound as number) - 1);
+
+		const runs = await api(alice, tenantA).get("/billing/reconciliation-runs");
+		expect(runs.status).toBe(200);
+		expect(runs.body).toHaveLength(2);
+
+		const isolation = await api(bob, tenantB).get(
+			`/billing/reconciliation-runs/${dirtyRun.id}`,
+		);
+		expect(isolation.status).toBe(404);
+	});
+
 	async function currentPlanId(): Promise<string> {
 		const plans = await dataSource.query(
 			"SELECT id FROM plans WHERE tenant_id = $1 ORDER BY created_at ASC LIMIT 1",
@@ -440,6 +788,53 @@ describe("Billing and invoicing (integration)", () => {
 			});
 		expect(response.status).toBe(201);
 		return response.body;
+	}
+
+	async function waitForPeriodInvoice(
+		billingPeriodId: string,
+	): Promise<Record<string, unknown>> {
+		for (let attempt = 0; attempt < 100; attempt += 1) {
+			const response = await api(alice, tenantA).get(
+				`/billing-periods/${billingPeriodId}/invoice`,
+			);
+			if (response.status === 200) {
+				return response.body as Record<string, unknown>;
+			}
+			await delay(50);
+		}
+		throw new Error("The invoice was not generated in time.");
+	}
+
+	async function waitForOperation(
+		operationId: string,
+	): Promise<Record<string, unknown>> {
+		for (let attempt = 0; attempt < 100; attempt += 1) {
+			const response = await api(alice, tenantA).get(
+				`/billing-operations/${operationId}`,
+			);
+			if (response.status === 200 && response.body.status === "completed") {
+				return response.body as Record<string, unknown>;
+			}
+			await delay(50);
+		}
+		throw new Error("The billing operation did not complete in time.");
+	}
+
+	async function waitForRun(runId: string): Promise<Record<string, unknown>> {
+		for (let attempt = 0; attempt < 100; attempt += 1) {
+			const response = await api(alice, tenantA).get(
+				`/billing/reconciliation-runs/${runId}`,
+			);
+			if (
+				response.status === 200 &&
+				(response.body.status === "completed" ||
+					response.body.status === "failed")
+			) {
+				return response.body as Record<string, unknown>;
+			}
+			await delay(50);
+		}
+		throw new Error("The reconciliation run did not complete in time.");
 	}
 
 	function attach(priceId: string, extra: Record<string, unknown>) {

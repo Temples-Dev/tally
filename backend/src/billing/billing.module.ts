@@ -8,11 +8,22 @@ import { IdentityModule } from "../identity/identity.module";
 import { JobsModule } from "../jobs/jobs.module";
 import { CustomerAccount } from "../subscriptions/entities/customer-account.entity";
 import { Subscription } from "../subscriptions/entities/subscription.entity";
+import { BillingCorrectionsController } from "./billing-corrections.controller";
+import { BillingCorrectionsService } from "./billing-corrections.service";
 import { BillingInvoiceHandler } from "./billing-invoice.handler";
+import { BillingReconciliationController } from "./billing-reconciliation.controller";
+import { BillingReconciliationHandler } from "./billing-reconciliation.handler";
+import { BillingReconciliationService } from "./billing-reconciliation.service";
 import { BillingController } from "./billing.controller";
 import { BillingService } from "./billing.service";
+import { BillingAdjustment } from "./entities/billing-adjustment.entity";
 import { BillingCalculation } from "./entities/billing-calculation.entity";
+import { BillingDiscrepancy } from "./entities/billing-discrepancy.entity";
+import { BillingOperation } from "./entities/billing-operation.entity";
 import { BillingPeriod } from "./entities/billing-period.entity";
+import { BillingReconciliationRun } from "./entities/billing-reconciliation-run.entity";
+import { CreditNoteLine } from "./entities/credit-note-line.entity";
+import { CreditNote } from "./entities/credit-note.entity";
 import { InvoiceLineItem } from "./entities/invoice-line-item.entity";
 import { InvoiceNumberSequence } from "./entities/invoice-number-sequence.entity";
 import { Invoice } from "./entities/invoice.entity";
@@ -26,6 +37,12 @@ import { PricingService } from "./pricing.service";
 			Price,
 			SubscriptionItem,
 			BillingPeriod,
+			BillingOperation,
+			BillingAdjustment,
+			CreditNote,
+			CreditNoteLine,
+			BillingReconciliationRun,
+			BillingDiscrepancy,
 			BillingCalculation,
 			Invoice,
 			InvoiceLineItem,
@@ -39,8 +56,19 @@ import { PricingService } from "./pricing.service";
 		IdentityModule,
 		JobsModule,
 	],
-	controllers: [BillingController],
-	providers: [PricingService, BillingService, BillingInvoiceHandler],
-	exports: [PricingService, BillingService],
+	controllers: [
+		BillingController,
+		BillingCorrectionsController,
+		BillingReconciliationController,
+	],
+	providers: [
+		PricingService,
+		BillingService,
+		BillingCorrectionsService,
+		BillingReconciliationService,
+		BillingInvoiceHandler,
+		BillingReconciliationHandler,
+	],
+	exports: [PricingService, BillingService, BillingCorrectionsService],
 })
 export class BillingModule {}

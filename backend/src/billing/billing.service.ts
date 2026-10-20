@@ -29,13 +29,16 @@ import {
 } from "./billing-money";
 import type {
 	CreateBillingPeriodDto,
+	ListBillingPeriodsQueryDto,
 	ListInvoicesQueryDto,
 } from "./billing.dto";
 import { BillingPeriod } from "./entities/billing-period.entity";
 import { InvoiceLineItem } from "./entities/invoice-line-item.entity";
 import { Invoice } from "./entities/invoice.entity";
 import {
+	AdjustmentType,
 	BillingCalculationStatus,
+	type BillingOperationStatus,
 	BillingPeriodStatus,
 	InvoiceLineType,
 	type InvoiceStatus,
@@ -55,6 +58,45 @@ export interface BillingPeriodBody {
 	calculationVersion: number;
 	completedAt: string | null;
 	createdAt: string;
+	invoiceId: string | null;
+	invoiceNumber: string | null;
+	invoiceStatus: InvoiceStatus | null;
+	invoiceTotal: string | null;
+}
+
+export interface BillingOperationBody {
+	id: string;
+	operationType: string;
+	sourceType: string;
+	sourceId: string | null;
+	idempotencyKey: string;
+	status: BillingOperationStatus;
+	attemptCount: number;
+	lastErrorCode: string | null;
+	invoiceId: string | null;
+	createdAt: string;
+	updatedAt: string;
+}
+
+interface OperationRow {
+	id: string;
+	operationType: string;
+	sourceType: string;
+	sourceId: string | null;
+	idempotencyKey: string;
+	status: BillingOperationStatus;
+	attemptCount: number;
+	lastErrorCode: string | null;
+	invoiceId: string | null;
+	createdAt: Date;
+	updatedAt: Date;
+}
+
+interface AdjustmentRow {
+	id: string;
+	adjustmentType: AdjustmentType;
+	amount: string;
+	reason: string;
 }
 
 export interface InvoiceBody {
@@ -162,7 +204,7 @@ interface ChargeLine {
 	amount: bigint;
 	sourceType: string;
 	sourceId: string;
-	priceId: string;
+	priceId: string | null;
 	metadata: Record<string, unknown>;
 }
 
@@ -289,12 +331,90 @@ export class BillingService {
 		return this.toPeriodBody(period);
 	}
 
+	async listPeriods(
+		tenantId: string,
+		query: ListBillingPeriodsQueryDto,
+	): Promise<BillingPeriodBody[]> {
+		const rows = (await this.dataSource.query(
+			`
+			SELECT p.id, p.subscription_id AS "subscriptionId",
+				p.period_start AS "periodStart", p.period_end AS "periodEnd",
+				p.status, p.calculation_version AS "calculationVersion",
+				p.completed_at AS "completedAt", p.created_at AS "createdAt",
+				i.id AS "invoiceId", i.invoice_number AS "invoiceNumber",
+				i.status AS "invoiceStatus", i.total AS "invoiceTotal"
+			FROM billing_periods p
+			LEFT JOIN invoices i
+				ON i.tenant_id = p.tenant_id AND i.billing_period_id = p.id
+			WHERE p.tenant_id = $1
+				AND ($2::text IS NULL OR p.status = $2)
+				AND ($3::uuid IS NULL OR p.subscription_id = $3)
+				AND ($4::timestamptz IS NULL OR p.period_start >= $4)
+				AND ($5::timestamptz IS NULL OR p.period_start <= $5)
+			ORDER BY p.period_start DESC
+			LIMIT $6
+			`,
+			[
+				tenantId,
+				query.status ?? null,
+				query.subscriptionId ?? null,
+				query.from === undefined ? null : new Date(query.from),
+				query.to === undefined ? null : new Date(query.to),
+				query.limit ?? 50,
+			],
+		)) as Array<
+			PeriodRow & {
+				invoiceId: string | null;
+				invoiceNumber: string | null;
+				invoiceStatus: InvoiceStatus | null;
+				invoiceTotal: string | null;
+			}
+		>;
+		return rows.map((row) => ({
+			...this.toPeriodBody(row),
+			invoiceId: row.invoiceId,
+			invoiceNumber: row.invoiceNumber,
+			invoiceStatus: row.invoiceStatus,
+			invoiceTotal:
+				row.invoiceTotal === null ? null : this.money(row.invoiceTotal),
+		}));
+	}
+
+	async getOperation(
+		tenantId: string,
+		operationId: string,
+	): Promise<BillingOperationBody> {
+		const rows = (await this.dataSource.query(
+			`
+			SELECT id, operation_type AS "operationType",
+				source_type AS "sourceType", source_id AS "sourceId",
+				idempotency_key AS "idempotencyKey", status,
+				attempt_count AS "attemptCount",
+				last_error_code AS "lastErrorCode", invoice_id AS "invoiceId",
+				created_at AS "createdAt", updated_at AS "updatedAt"
+			FROM billing_operations
+			WHERE tenant_id = $1 AND id = $2
+			`,
+			[tenantId, operationId],
+		)) as OperationRow[];
+		const row = rows[0];
+		if (row === undefined) {
+			throw new NotFoundException("Billing operation not found.");
+		}
+		return this.toOperationBody(row);
+	}
+
 	async requestInvoice(
 		tenantId: string,
 		periodId: string,
 	): Promise<
 		| { status: "existing"; invoice: InvoiceBody }
-		| { status: "queued"; jobId: string; billingPeriodId: string }
+		| {
+				status: "queued";
+				jobId: string;
+				operationId: string;
+				billingPeriodId: string;
+		  }
 	> {
 		const period = await this.periods.findOneBy({ tenantId, id: periodId });
 		if (period === null) {
@@ -310,15 +430,50 @@ export class BillingService {
 		if (period.status !== BillingPeriodStatus.OPEN) {
 			throw new ConflictException("The billing period is not open.");
 		}
-		const job = await this.jobs.enqueue({
-			tenantId,
-			jobType: BILLING_INVOICE_JOB,
-			idempotencyKey: `billing.invoice.generate:${period.id}`,
-			payload: { tenantId, billingPeriodId: period.id },
+		const queued = await this.dataSource.transaction(async (manager) => {
+			const operations = (await manager.query(
+				`
+				INSERT INTO billing_operations (
+					tenant_id, operation_type, source_type, source_id,
+					idempotency_key, status
+				)
+				VALUES ($1, $2, 'billing_period', $3, $4, 'pending')
+				ON CONFLICT (tenant_id, idempotency_key)
+				DO UPDATE SET
+					status = CASE
+						WHEN billing_operations.status = 'completed' THEN 'completed'
+						WHEN billing_operations.status = 'running' THEN 'running'
+						ELSE 'pending'
+					END,
+					updated_at = now()
+				RETURNING id
+				`,
+				[
+					tenantId,
+					BILLING_INVOICE_JOB,
+					period.id,
+					`${BILLING_INVOICE_JOB}:${period.id}`,
+				],
+			)) as Array<{ id: string }>;
+			const operationId = operations[0]?.id;
+			if (operationId === undefined) {
+				throw new Error("The billing operation could not be created.");
+			}
+			const job = await this.jobs.enqueue(
+				{
+					tenantId,
+					jobType: BILLING_INVOICE_JOB,
+					idempotencyKey: `${BILLING_INVOICE_JOB}:${period.id}`,
+					payload: { tenantId, billingPeriodId: period.id },
+				},
+				manager,
+			);
+			return { operationId, jobId: job.id };
 		});
 		return {
 			status: "queued",
-			jobId: job.id,
+			jobId: queued.jobId,
+			operationId: queued.operationId,
 			billingPeriodId: period.id,
 		};
 	}
@@ -327,12 +482,14 @@ export class BillingService {
 		tenantId: string,
 		billingPeriodId: string,
 	): Promise<InvoiceBody> {
-		return this.dataSource.transaction(async (manager) => {
-			await manager.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
-				`billing-period:${billingPeriodId}`,
-			]);
-			const periodRows = (await manager.query(
-				`
+		const operation = await this.claimOperation(tenantId, billingPeriodId);
+		try {
+			const invoice = await this.dataSource.transaction(async (manager) => {
+				await manager.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+					`billing-period:${billingPeriodId}`,
+				]);
+				const periodRows = (await manager.query(
+					`
 				SELECT id, subscription_id AS "subscriptionId",
 					period_start AS "periodStart", period_end AS "periodEnd",
 					status, calculation_version AS "calculationVersion",
@@ -341,37 +498,37 @@ export class BillingService {
 				WHERE tenant_id = $1 AND id = $2
 				FOR UPDATE
 				`,
-				[tenantId, billingPeriodId],
-			)) as PeriodRow[];
-			const period = periodRows[0];
-			if (period === undefined) {
-				throw new NotFoundException("Billing period not found.");
-			}
-			const existing = await this.findInvoiceByPeriod(
-				manager,
-				tenantId,
-				period.id,
-			);
-			if (existing !== null) {
-				return this.toInvoiceBody(existing);
-			}
-			if (period.status !== BillingPeriodStatus.OPEN) {
-				throw new ConflictException("The billing period is not open.");
-			}
-			const subscription = await manager
-				.getRepository(Subscription)
-				.findOneBy({ tenantId, id: period.subscriptionId });
-			if (subscription === null) {
-				throw new NotFoundException("Subscription not found.");
-			}
-			const customer = await manager
-				.getRepository(CustomerAccount)
-				.findOneBy({ tenantId, id: subscription.customerAccountId });
-			if (customer === null) {
-				throw new NotFoundException("Customer account not found.");
-			}
-			const items = (await manager.query(
-				`
+					[tenantId, billingPeriodId],
+				)) as PeriodRow[];
+				const period = periodRows[0];
+				if (period === undefined) {
+					throw new NotFoundException("Billing period not found.");
+				}
+				const existing = await this.findInvoiceByPeriod(
+					manager,
+					tenantId,
+					period.id,
+				);
+				if (existing !== null) {
+					return this.toInvoiceBody(existing);
+				}
+				if (period.status !== BillingPeriodStatus.OPEN) {
+					throw new ConflictException("The billing period is not open.");
+				}
+				const subscription = await manager
+					.getRepository(Subscription)
+					.findOneBy({ tenantId, id: period.subscriptionId });
+				if (subscription === null) {
+					throw new NotFoundException("Subscription not found.");
+				}
+				const customer = await manager
+					.getRepository(CustomerAccount)
+					.findOneBy({ tenantId, id: subscription.customerAccountId });
+				if (customer === null) {
+					throw new NotFoundException("Customer account not found.");
+				}
+				const items = (await manager.query(
+					`
 				SELECT i.id AS "itemId", i.quantity, i.description,
 					p.id AS "priceId", p.price_code AS "priceCode",
 					p.version_number AS "versionNumber", p.currency,
@@ -382,63 +539,77 @@ export class BillingService {
 				WHERE i.tenant_id = $1 AND i.subscription_id = $2
 				ORDER BY p.price_code ASC
 				`,
-				[tenantId, subscription.id],
-			)) as BillableItemRow[];
-			if (items.length === 0) {
-				throw new UnprocessableEntityException(
-					"The subscription has no billable items.",
+					[tenantId, subscription.id],
+				)) as BillableItemRow[];
+				if (items.length === 0) {
+					throw new UnprocessableEntityException(
+						"The subscription has no billable items.",
+					);
+				}
+				const currencies = new Set(
+					items.map((item) => item.currency.toUpperCase()),
 				);
-			}
-			const currencies = new Set(
-				items.map((item) => item.currency.toUpperCase()),
-			);
-			if (currencies.size !== 1) {
-				throw new UnprocessableEntityException(
-					"All subscription items must share one invoice currency.",
-				);
-			}
-			const currency = [...currencies][0] ?? "";
-			const precision = currencyPrecision(currency);
-			if (precision === null) {
-				throw new UnprocessableEntityException(
-					`Currency ${currency} is not supported.`,
-				);
-			}
+				if (currencies.size !== 1) {
+					throw new UnprocessableEntityException(
+						"All subscription items must share one invoice currency.",
+					);
+				}
+				const currency = [...currencies][0] ?? "";
+				const precision = currencyPrecision(currency);
+				if (precision === null) {
+					throw new UnprocessableEntityException(
+						`Currency ${currency} is not supported.`,
+					);
+				}
 
-			const lines: ChargeLine[] = [];
-			const usageSnapshot: Array<Record<string, unknown>> = [];
-			for (const item of items) {
-				const line = await this.calculateLine(
+				const lines: ChargeLine[] = [];
+				const usageSnapshot: Array<Record<string, unknown>> = [];
+				for (const item of items) {
+					const line = await this.calculateLine(
+						manager,
+						tenantId,
+						subscription,
+						period,
+						item,
+						precision,
+						usageSnapshot,
+					);
+					lines.push(line);
+				}
+				if (lines.length === 0) {
+					throw new UnprocessableEntityException(
+						"No billable charges were found for this period.",
+					);
+				}
+				const adjustmentsSnapshot = await this.applyAdjustments(
 					manager,
 					tenantId,
 					subscription,
 					period,
-					item,
+					currency,
 					precision,
-					usageSnapshot,
+					lines,
 				);
-				lines.push(line);
-			}
-			if (lines.length === 0) {
-				throw new UnprocessableEntityException(
-					"No billable charges were found for this period.",
+				const subtotal = sumAmounts(lines.map((line) => line.amount));
+				if (subtotal < 0n) {
+					throw new UnprocessableEntityException(
+						"Billing adjustments exceed the invoice charges.",
+					);
+				}
+				const invoiceNumber = await this.allocateInvoiceNumber(
+					manager,
+					tenantId,
+					new Date(),
 				);
-			}
-			const subtotal = sumAmounts(lines.map((line) => line.amount));
-			const invoiceNumber = await this.allocateInvoiceNumber(
-				manager,
-				tenantId,
-				new Date(),
-			);
-			const issuedAt = new Date();
-			const dueAt = new Date(issuedAt.getTime() + DUE_DAYS * 86_400_000);
-			const profile = {
-				displayName: customer.displayName,
-				email: customer.email,
-				customerAccountId: customer.id,
-			};
-			const inserted = (await manager.query(
-				`
+				const issuedAt = new Date();
+				const dueAt = new Date(issuedAt.getTime() + DUE_DAYS * 86_400_000);
+				const profile = {
+					displayName: customer.displayName,
+					email: customer.email,
+					customerAccountId: customer.id,
+				};
+				const inserted = (await manager.query(
+					`
 				INSERT INTO invoices (
 					tenant_id, customer_account_id, billing_period_id, invoice_number,
 					billing_profile_snapshot, currency, status, issued_at, due_at,
@@ -451,28 +622,41 @@ export class BillingService {
 				)
 				RETURNING id
 				`,
-				[
-					tenantId,
-					customer.id,
-					period.id,
-					invoiceNumber,
-					JSON.stringify(profile),
-					currency,
-					issuedAt,
-					dueAt,
-					period.periodStart,
-					period.periodEnd,
-					formatDecimal(subtotal),
-				],
-			)) as Array<{ id: string }>;
-			const invoiceId = inserted[0]?.id;
-			if (invoiceId === undefined) {
-				throw new Error("The invoice could not be created.");
-			}
-			let lineNumber = 1;
-			for (const line of lines) {
-				await manager.query(
-					`
+					[
+						tenantId,
+						customer.id,
+						period.id,
+						invoiceNumber,
+						JSON.stringify(profile),
+						currency,
+						issuedAt,
+						dueAt,
+						period.periodStart,
+						period.periodEnd,
+						formatDecimal(subtotal),
+					],
+				)) as Array<{ id: string }>;
+				const invoiceId = inserted[0]?.id;
+				if (invoiceId === undefined) {
+					throw new Error("The invoice could not be created.");
+				}
+				const adjustmentIds = adjustmentsSnapshot.map(
+					(adjustment) => adjustment.id,
+				);
+				if (adjustmentIds.length > 0) {
+					await manager.query(
+						`
+					UPDATE billing_adjustments
+					SET status = 'applied', invoice_id = $2, applied_at = now()
+					WHERE tenant_id = $1 AND id = ANY($3::uuid[])
+					`,
+						[tenantId, invoiceId, adjustmentIds],
+					);
+				}
+				let lineNumber = 1;
+				for (const line of lines) {
+					await manager.query(
+						`
 					INSERT INTO invoice_line_items (
 						tenant_id, invoice_id, line_number, line_type, description,
 						quantity, unit_price, amount, currency, source_type, source_id,
@@ -480,26 +664,26 @@ export class BillingService {
 					)
 					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
 					`,
-					[
-						tenantId,
-						invoiceId,
-						lineNumber,
-						line.lineType,
-						line.description,
-						formatDecimal(line.quantity),
-						formatDecimal(line.unitPrice),
-						formatDecimal(line.amount),
-						currency,
-						line.sourceType,
-						line.sourceId,
-						line.priceId,
-						JSON.stringify(line.metadata),
-					],
-				);
-				lineNumber += 1;
-			}
-			await manager.query(
-				`
+						[
+							tenantId,
+							invoiceId,
+							lineNumber,
+							line.lineType,
+							line.description,
+							formatDecimal(line.quantity),
+							formatDecimal(line.unitPrice),
+							formatDecimal(line.amount),
+							currency,
+							line.sourceType,
+							line.sourceId,
+							line.priceId,
+							JSON.stringify(line.metadata),
+						],
+					);
+					lineNumber += 1;
+				}
+				await manager.query(
+					`
 				INSERT INTO billing_calculations (
 					tenant_id, subscription_id, billing_period_id,
 					pricing_version_reference, usage_snapshot_reference, currency,
@@ -508,60 +692,67 @@ export class BillingService {
 				)
 				VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, 0, 0, $7, $8, $9)
 				`,
-				[
-					tenantId,
-					subscription.id,
-					period.id,
-					JSON.stringify({
-						items: items.map((item) => ({
-							priceId: item.priceId,
-							priceCode: item.priceCode,
-							versionNumber: item.versionNumber,
-							pricingModel: item.pricingModel,
-							configuration: item.configuration,
-						})),
-					}),
-					JSON.stringify({ metrics: usageSnapshot }),
-					currency,
-					formatDecimal(subtotal),
-					period.calculationVersion,
-					BillingCalculationStatus.COMPLETED,
-				],
-			);
-			await manager.query(
-				`
+					[
+						tenantId,
+						subscription.id,
+						period.id,
+						JSON.stringify({
+							items: items.map((item) => ({
+								priceId: item.priceId,
+								priceCode: item.priceCode,
+								versionNumber: item.versionNumber,
+								pricingModel: item.pricingModel,
+								configuration: item.configuration,
+							})),
+							adjustments: adjustmentsSnapshot,
+						}),
+						JSON.stringify({ metrics: usageSnapshot }),
+						currency,
+						formatDecimal(subtotal),
+						period.calculationVersion,
+						BillingCalculationStatus.COMPLETED,
+					],
+				);
+				await manager.query(
+					`
 				UPDATE billing_periods
 				SET status = 'invoiced', completed_at = now(), updated_at = now()
 				WHERE id = $1
 				`,
-				[period.id],
-			);
-			const invoice = await this.findInvoiceByPeriod(
-				manager,
-				tenantId,
-				period.id,
-			);
-			if (invoice === null) {
-				throw new Error("The invoice could not be loaded.");
-			}
-			await this.audit.record(
-				{
+					[period.id],
+				);
+				const invoice = await this.findInvoiceByPeriod(
+					manager,
 					tenantId,
-					actorType: ActorType.SYSTEM,
-					action: "invoice.issued",
-					resourceType: "invoice",
-					resourceId: invoice.id,
-					metadata: {
-						billingPeriodId: period.id,
-						invoiceNumber,
-						total: formatDecimal(subtotal),
-						currency,
+					period.id,
+				);
+				if (invoice === null) {
+					throw new Error("The invoice could not be loaded.");
+				}
+				await this.audit.record(
+					{
+						tenantId,
+						actorType: ActorType.SYSTEM,
+						action: "invoice.issued",
+						resourceType: "invoice",
+						resourceId: invoice.id,
+						metadata: {
+							billingPeriodId: period.id,
+							invoiceNumber,
+							total: formatDecimal(subtotal),
+							currency,
+						},
 					},
-				},
-				manager,
-			);
-			return this.toInvoiceBody(invoice);
-		});
+					manager,
+				);
+				return this.toInvoiceBody(invoice);
+			});
+			await this.completeOperation(operation.id, invoice.id);
+			return invoice;
+		} catch (error: unknown) {
+			await this.failOperation(operation.id, billingErrorCode(error));
+			throw error;
+		}
 	}
 
 	async listInvoices(
@@ -617,6 +808,71 @@ export class BillingService {
 			order: { lineNumber: "ASC" },
 		});
 		return lines.map((line) => this.toLineBody(line));
+	}
+
+	private async applyAdjustments(
+		manager: import("typeorm").EntityManager,
+		tenantId: string,
+		subscription: Subscription,
+		period: PeriodRow,
+		currency: string,
+		precision: number,
+		lines: ChargeLine[],
+	): Promise<Array<Record<string, unknown>>> {
+		const rows = (await manager.query(
+			`
+			SELECT id, adjustment_type AS "adjustmentType", amount, reason
+			FROM billing_adjustments
+			WHERE tenant_id = $1 AND customer_account_id = $2
+				AND currency = $3 AND status = 'pending'
+				AND (subscription_id IS NULL OR subscription_id = $4)
+				AND created_at <= $5
+			ORDER BY created_at ASC
+			FOR UPDATE
+			`,
+			[
+				tenantId,
+				subscription.customerAccountId,
+				currency,
+				subscription.id,
+				period.periodEnd,
+			],
+		)) as AdjustmentRow[];
+		const snapshot: Array<Record<string, unknown>> = [];
+		for (const adjustment of rows) {
+			const parsed = parseDecimal(adjustment.amount) ?? 0n;
+			const amount = roundToCurrency(parsed, precision);
+			if (amount === 0n) {
+				continue;
+			}
+			const signed =
+				adjustment.adjustmentType === AdjustmentType.CREDIT ? -amount : amount;
+			lines.push({
+				lineType:
+					adjustment.adjustmentType === AdjustmentType.CREDIT
+						? InvoiceLineType.CREDIT
+						: InvoiceLineType.ADJUSTMENT,
+				description: `${adjustment.adjustmentType === AdjustmentType.CREDIT ? "Credit" : "Adjustment"}: ${adjustment.reason}`,
+				quantity: parseDecimal("1") ?? 1n,
+				unitPrice: amount,
+				amount: signed,
+				sourceType: "billing_adjustment",
+				sourceId: adjustment.id,
+				priceId: null,
+				metadata: {
+					adjustmentId: adjustment.id,
+					adjustmentType: adjustment.adjustmentType,
+					reason: adjustment.reason,
+				},
+			});
+			snapshot.push({
+				id: adjustment.id,
+				adjustmentType: adjustment.adjustmentType,
+				amount: formatDecimal(amount),
+				reason: adjustment.reason,
+			});
+		}
+		return snapshot;
 	}
 
 	private async calculateLine(
@@ -797,7 +1053,85 @@ export class BillingService {
 		return rows[0] ?? null;
 	}
 
-	private toPeriodBody(period: BillingPeriod): BillingPeriodBody {
+	private async claimOperation(
+		tenantId: string,
+		billingPeriodId: string,
+	): Promise<{ id: string }> {
+		const rows = (await this.dataSource.query(
+			`
+			INSERT INTO billing_operations (
+				tenant_id, operation_type, source_type, source_id,
+				idempotency_key, status, attempt_count
+			)
+			VALUES ($1, $2, 'billing_period', $3, $4, 'running', 1)
+			ON CONFLICT (tenant_id, idempotency_key)
+			DO UPDATE SET
+				status = 'running',
+				attempt_count = billing_operations.attempt_count + 1,
+				last_error_code = NULL,
+				updated_at = now()
+			RETURNING id
+			`,
+			[
+				tenantId,
+				BILLING_INVOICE_JOB,
+				billingPeriodId,
+				`${BILLING_INVOICE_JOB}:${billingPeriodId}`,
+			],
+		)) as Array<{ id: string }>;
+		const operation = rows[0];
+		if (operation === undefined) {
+			throw new Error("The billing operation could not be claimed.");
+		}
+		return operation;
+	}
+
+	private async completeOperation(
+		operationId: string,
+		invoiceId: string,
+	): Promise<void> {
+		await this.dataSource.query(
+			`
+			UPDATE billing_operations
+			SET status = 'completed', invoice_id = $2, last_error_code = NULL,
+				updated_at = now()
+			WHERE id = $1
+			`,
+			[operationId, invoiceId],
+		);
+	}
+
+	private async failOperation(
+		operationId: string,
+		errorCode: string,
+	): Promise<void> {
+		await this.dataSource.query(
+			`
+			UPDATE billing_operations
+			SET status = 'failed', last_error_code = $2, updated_at = now()
+			WHERE id = $1
+			`,
+			[operationId, errorCode],
+		);
+	}
+
+	private toOperationBody(row: OperationRow): BillingOperationBody {
+		return {
+			id: row.id,
+			operationType: row.operationType,
+			sourceType: row.sourceType,
+			sourceId: row.sourceId,
+			idempotencyKey: row.idempotencyKey,
+			status: row.status,
+			attemptCount: row.attemptCount,
+			lastErrorCode: row.lastErrorCode,
+			invoiceId: row.invoiceId,
+			createdAt: row.createdAt.toISOString(),
+			updatedAt: row.updatedAt.toISOString(),
+		};
+	}
+
+	private toPeriodBody(period: BillingPeriod | PeriodRow): BillingPeriodBody {
 		return {
 			id: period.id,
 			subscriptionId: period.subscriptionId,
@@ -808,6 +1142,10 @@ export class BillingService {
 			completedAt:
 				period.completedAt === null ? null : period.completedAt.toISOString(),
 			createdAt: period.createdAt.toISOString(),
+			invoiceId: null,
+			invoiceNumber: null,
+			invoiceStatus: null,
+			invoiceTotal: null,
 		};
 	}
 
@@ -860,6 +1198,21 @@ export class BillingService {
 		const parsed = parseDecimal(raw);
 		return parsed === null ? raw : formatDecimal(parsed);
 	}
+}
+
+function billingErrorCode(error: unknown): string {
+	if (
+		error !== null &&
+		typeof error === "object" &&
+		"code" in error &&
+		typeof error.code === "string"
+	) {
+		return error.code;
+	}
+	if (error instanceof Error) {
+		return error.name;
+	}
+	return "UNKNOWN";
 }
 
 function returnedRows<T>(result: unknown): T[] {

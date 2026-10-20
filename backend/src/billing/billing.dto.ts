@@ -1,3 +1,4 @@
+import { Type } from "class-transformer";
 import {
 	IsDateString,
 	IsEnum,
@@ -13,7 +14,12 @@ import {
 	MinLength,
 } from "class-validator";
 
-import { BillingInterval, InvoiceStatus, PricingModel } from "./enums";
+import {
+	BillingInterval,
+	BillingPeriodStatus,
+	InvoiceStatus,
+	PricingModel,
+} from "./enums";
 
 const QUANTITY_PATTERN = /^\d{1,16}(?:\.\d{1,8})?$/;
 
@@ -82,6 +88,31 @@ export class CreateBillingPeriodDto {
 	@IsOptional()
 	@IsDateString()
 	periodEnd?: string;
+}
+
+export class ListBillingPeriodsQueryDto {
+	@IsOptional()
+	@IsEnum(BillingPeriodStatus)
+	status?: BillingPeriodStatus;
+
+	@IsOptional()
+	@IsUUID()
+	subscriptionId?: string;
+
+	@IsOptional()
+	@IsDateString()
+	from?: string;
+
+	@IsOptional()
+	@IsDateString()
+	to?: string;
+
+	@IsOptional()
+	@Type(() => Number)
+	@IsInt()
+	@Min(1)
+	@Max(100)
+	limit?: number;
 }
 
 export class ListInvoicesQueryDto {

@@ -28,6 +28,7 @@ import {
 	CreateBillingPeriodDto,
 	CreatePriceDto,
 	CreateSubscriptionItemDto,
+	ListBillingPeriodsQueryDto,
 	ListInvoicesQueryDto,
 } from "./billing.dto";
 // biome-ignore lint/style/useImportType: injected tokens must be value imports for decorator metadata.
@@ -125,6 +126,26 @@ export class BillingController {
 			this.requireIdentity(identityId),
 			dto,
 		);
+	}
+
+	@Get("billing-periods")
+	@ApiOperation({ summary: "List billing periods" })
+	@ApiOkResponse({ description: "Billing periods" })
+	listPeriods(
+		@Query() query: ListBillingPeriodsQueryDto,
+		@CurrentTenantId() tenantId?: string,
+	) {
+		return this.billing.listPeriods(requireTenant(tenantId), query);
+	}
+
+	@Get("billing-operations/:operationId")
+	@ApiOperation({ summary: "Retrieve a billing operation" })
+	@ApiOkResponse({ description: "Billing operation" })
+	getOperation(
+		@Param("operationId", ParseUUIDPipe) operationId: string,
+		@CurrentTenantId() tenantId?: string,
+	) {
+		return this.billing.getOperation(requireTenant(tenantId), operationId);
 	}
 
 	@Get("billing-periods/:periodId")

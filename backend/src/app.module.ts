@@ -7,6 +7,7 @@ import { ConfigModule, ConfigService } from "@nestjs/config";
 import { APP_FILTER, APP_GUARD } from "@nestjs/core";
 import { TypeOrmModule } from "@nestjs/typeorm";
 
+import { BillingModule } from "./billing/billing.module";
 import { CatalogModule } from "./catalog/catalog.module";
 import { CorrelationIdMiddleware } from "./common/correlation-id.middleware";
 import { ProblemDetailsFilter } from "./common/problem-details.filter";
@@ -36,6 +37,7 @@ import { UsageModule } from "./usage/usage.module";
 		SubscriptionsModule,
 		UsageModule,
 		QuotasModule,
+		BillingModule,
 	],
 	providers: [
 		{ provide: APP_GUARD, useClass: JwtAuthGuard },
